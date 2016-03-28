@@ -5,6 +5,7 @@ import subprocess
 import time
 import urllib3
 import json
+import socket
 
 
 LOGGER = logging.getLogger(__name__)
@@ -12,11 +13,18 @@ APP_ID = os.getenv('MARATHON_APP_ID')
 MARATHON_URI = os.environ.get('MARATHON_URI', 'http://leader.mesos:8080')
 HOST_IP = os.getenv('HOST', '127.0.0.1')
 HOST_NAME = os.getenv('HOSTNAME')  # docker container_id
+MARATHON_AUTHENTICATION = os.getenv('MARATHON_AUTHENTICATION')
 
 
 def get_marathon_tasks(app_id):
     http = urllib3.PoolManager()
-    response = http.request('GET', '%s/v2/apps%s/tasks' % (MARATHON_URI, app_id))
+
+    headers = None
+    if MARATHON_AUTHENTICATION:
+        headers = urllib3.util.make_headers(basic_auth=MARATHON_AUTHENTICATION)
+
+    response = http.request('GET', '%s/v2/apps%s/tasks' % (MARATHON_URI, app_id),
+                            headers=headers)
     state = json.loads(response.data)
     return state['tasks']
 
@@ -58,7 +66,7 @@ def configure_name_resolving(node_ips=None):
             for node_ip in node_ips:
                 if node_ip != current_node_ip:
                     node_hostname = node_ip.replace('.', '-')
-                    node_host_entry = '%s %s' % (node_ip, node_hostname)
+                    node_host_entry = '%s %s' % (socket.gethostbyname(node_ip), node_hostname)
                     f.write(node_host_entry + '\n')
                     LOGGER.info('+%s' + node_host_entry)
     LOGGER.info('Changing hostname as %s...', current_node_hostname)
@@ -137,12 +145,24 @@ def run():
     current_node_hostname = configure_name_resolving(node_ips)
     configure_rabbitmq(current_node_hostname, node_ips)
     master_node_ip = get_cluster_master_node_ip(node_ips)
-    if not master_node_ip:
-        LOGGER.info("There is no other node, running as master node...")
-    else:
-        LOGGER.info("Master node %s detected, connecting to master...", master_node_ip)
+
+    os.environ['RABBITMQ_PID_FILE'] = '/rabbitmq.pid'
     subprocess.call(['rabbitmq-server'])
 
+    if master_node_ip:
+        LOGGER.info("Master node %s detected, connecting to master...", master_node_ip)
+
+        current_cluster = master_node_ip.replace('.', '-')
+
+        subprocess.call(['rabbitmqctl', 'stop_app'])
+        subprocess.call(['rabbitmqctl', 'reset'])
+        subprocess.call(['rabbitmqctl', 'wait', os.environ['RABBITMQ_PID_FILE']])
+        time.sleep(60)
+        subprocess.call(['rabbitmqctl', 'join_cluster', 'rabbit@%s' % current_cluster])
+        subprocess.call(['rabbitmqctl', 'start_app'])
+        subprocess.call(['rabbitmqctl', 'cluster_status'])
+    else:
+        LOGGER.info("There is no other node, running as master node...")
 
 if __name__ == '__main__':
     logging.basicConfig(
