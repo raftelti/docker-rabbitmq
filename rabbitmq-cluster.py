@@ -6,6 +6,7 @@ import time
 import urllib3
 import json
 import socket
+import operator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -15,6 +16,8 @@ HOST_IP = os.getenv('HOST', '127.0.0.1')
 HOST_NAME = os.getenv('HOSTNAME')  # docker container_id
 MARATHON_AUTHENTICATION = os.getenv('MARATHON_AUTHENTICATION')
 
+MASTER_APP_IP = APP_ID.replace('/node', '/master')
+IS_MASTER = APP_ID.endswith('master')
 
 def get_marathon_tasks(app_id):
     http = urllib3.PoolManager()
@@ -26,7 +29,7 @@ def get_marathon_tasks(app_id):
     response = http.request('GET', '%s/v2/apps%s/tasks' % (MARATHON_URI, app_id),
                             headers=headers)
     state = json.loads(response.data)
-    return state['tasks']
+    return state.get('tasks', [])
 
 
 def get_cluster_node_ips():
@@ -41,18 +44,28 @@ def get_cluster_node_ips():
     return node_ips
 
 
-def get_cluster_master_node_ip(node_ips):
-    master_node_ip = None
-    if len(node_ips) > 0:
-        master_node_ip = node_ips[0]
-        LOGGER.info('Found master node %s' % master_node_ip)
-    return master_node_ip
+def get_cluster_master_node_ip():
+    tasks = sorted(get_marathon_tasks(MASTER_APP_IP), key=operator.itemgetter('startedAt'))
+    if tasks and tasks[0].get('healthCheckResults') and tasks[0]['healthCheckResults'][0]['alive']:
+        LOGGER.info('Found master node %s' % tasks[0]['host'])
+        return tasks[0]['host']
+
+
+def is_healthy():
+    return bool(filter(lambda task: task.get('healthCheckResults') and \
+                                    task['healthCheckResults'][0]['alive'] and \
+                                    task['host'] == HOST_IP,
+                       get_marathon_tasks(APP_ID)))
 
 
 def configure_name_resolving(node_ips=None):
     LOGGER.info('Adding extra entries to /etc/hosts...')
     current_node_ip = HOST_IP
     current_node_hostname = current_node_ip.replace('.', '-')
+
+    if IS_MASTER:
+        current_node_hostname = 'master'
+
     with open('/etc/hosts', 'a') as f:
         LOGGER.info('Adding current node entries')
         host_name_entry = '127.0.0.1 %s' % HOST_NAME
@@ -61,17 +74,31 @@ def configure_name_resolving(node_ips=None):
         current_host_entry = '127.0.0.1 %s' % current_node_hostname
         f.write(current_host_entry + '\n')
         LOGGER.info('+' + current_host_entry)
-        if node_ips:
-            LOGGER.info('Adding other node entries')
+    LOGGER.info('Changing hostname as %s...', current_node_hostname)
+    os.putenv('HOSTNAME', current_node_hostname)
+
+    return current_node_hostname
+
+
+def add_hosts_entries(node_ips=None):
+    current_node_ip = HOST_IP
+    if node_ips:
+        LOGGER.info('Adding other node entries')
+        with open('/etc/hosts', 'a') as f:
             for node_ip in node_ips:
                 if node_ip != current_node_ip:
                     node_hostname = node_ip.replace('.', '-')
                     node_host_entry = '%s %s' % (socket.gethostbyname(node_ip), node_hostname)
                     f.write(node_host_entry + '\n')
-                    LOGGER.info('+%s' + node_host_entry)
-    LOGGER.info('Changing hostname as %s...', current_node_hostname)
-    os.putenv('HOSTNAME', current_node_hostname)
-    return current_node_hostname
+                    LOGGER.info('+%s' % node_host_entry)
+
+
+def add_master_host_entry(node_ip):
+    LOGGER.info('Adding master node entry')
+    with open('/etc/hosts', 'a') as f:
+        node_host_entry = '%s master' % socket.gethostbyname(node_ip)
+        f.write(node_host_entry + '\n')
+        LOGGER.info('+%s' % node_host_entry)
 
 
 def set_erlang_cookie():
@@ -115,15 +142,10 @@ def create_rabbitmq_config_file(node_ips=None):
         f.write('    [\n')
         f.write('     {loopback_users, []},\n')
         f.write('     {heartbeat, 580},\n')
+        f.write('     {cluster_partition_handling, pause_minority},\n')
         f.write('     {default_user, <<"%s">>},\n' % default_user)
         f.write('     {default_pass, <<"%s">>},\n' % default_pass)
-        f.write('     {default_vhost, <<"%s">>},\n' % default_vhost)
-        f.write('     {cluster_nodes, {[\n')
-        if node_ips:
-            nodes_str = ','.join(["'rabbit@%s'" % n.replace('.', '-')
-                                  for n in node_ips])
-            f.write('      %s\n' % nodes_str)
-        f.write('      ], disc}}\n')
+        f.write('     {default_vhost, <<"%s">>}\n' % default_vhost)
         f.write('    ]\n')
         f.write('  },\n')
         f.write('  {rabbitmq_management, [{listener, [{port, %s}]}]}\n'
@@ -132,10 +154,13 @@ def create_rabbitmq_config_file(node_ips=None):
 
 
 def configure_rabbitmq(current_node_hostname, node_ips):
+    LOGGER.info('Appending NODENAME to env.conf')
     with open('/etc/rabbitmq/rabbitmq-env.conf', 'a') as f:
         f.write('NODENAME=rabbit@%s\n' % current_node_hostname)
     # other settings are already in environment like port settings, see Dockerfile
+    LOGGER.info('Giving permission to /var/lib/rabbitmq')
     subprocess.call(['chown', '-R', 'rabbitmq', '/var/lib/rabbitmq'])
+    LOGGER.info('Setting erlang cookie')
     set_erlang_cookie()
     create_rabbitmq_config_file(node_ips)
 
@@ -144,29 +169,56 @@ def run():
     node_ips = get_cluster_node_ips()
     current_node_hostname = configure_name_resolving(node_ips)
     configure_rabbitmq(current_node_hostname, node_ips)
-    master_node_ip = get_cluster_master_node_ip(node_ips)
 
-    os.environ['RABBITMQ_PID_FILE'] = '/rabbitmq.pid'
-    subprocess.call(['rabbitmq-server'])
+    subprocess.call(['rabbitmq-server', '-detached'])
+    subprocess.call(['rabbitmqctl', 'reset'])
+    subprocess.call(['rabbitmqctl', 'start_app'])
 
-    if master_node_ip:
-        LOGGER.info("Master node %s detected, connecting to master...", master_node_ip)
+    # subprocess.call(['rabbitmqctl', 'set_policy', 'ha-all' ,'"^ha\."', '\'{"ha-mode":"all"}\''])
 
-        current_cluster = master_node_ip.replace('.', '-')
+    connected_to_cluster = False
+    known_nodes = []
+    while True:
+        if is_healthy():
+            tasks = filter(lambda task: task.get('healthCheckResults') and \
+                                    task['healthCheckResults'][0]['alive'] and \
+                                    task['host'] != HOST_IP and \
+                                    task['id'] not in known_nodes,
+                           get_marathon_tasks(APP_ID))
 
-        subprocess.call(['rabbitmqctl', 'stop_app'])
-        subprocess.call(['rabbitmqctl', 'reset'])
-        subprocess.call(['rabbitmqctl', 'wait', os.environ['RABBITMQ_PID_FILE']])
-        time.sleep(60)
-        subprocess.call(['rabbitmqctl', 'join_cluster', 'rabbit@%s' % current_cluster])
-        subprocess.call(['rabbitmqctl', 'start_app'])
-        subprocess.call(['rabbitmqctl', 'cluster_status'])
-    else:
-        LOGGER.info("There is no other node, running as master node...")
+            if tasks:
+                add_hosts_entries([task['host'] for task in tasks if task['id'] not in known_nodes])
+                known_nodes += [task['id'] for task in tasks]
+
+
+            if not connected_to_cluster and not IS_MASTER:
+                tasks = filter(lambda task: task.get('healthCheckResults') and \
+                                        task['healthCheckResults'][0]['alive'],
+                               get_marathon_tasks(MASTER_APP_IP) + tasks)
+                if tasks:
+                    cluster_master_node_ip = tasks[0]['host']
+                    if tasks[0]['appId'].endswith('master'):
+                        add_master_host_entry(cluster_master_node_ip)
+                        cluster_master_node_ip = 'master'
+
+                    if cluster_master_node_ip != HOST_IP:
+                        cluster_master_node_ip = cluster_master_node_ip.replace('.', '-')
+
+                        subprocess.call(['rabbitmqctl', 'stop_app'])
+
+                        LOGGER.info("Connecting to %s ...", cluster_master_node_ip)
+                        subprocess.call(['rabbitmqctl', 'join_cluster', 'rabbit@%s' % cluster_master_node_ip])
+                        LOGGER.info("Connected to %s ...", cluster_master_node_ip)
+
+                        subprocess.call(['rabbitmqctl', 'start_app'])
+
+                    connected_to_cluster = True
+
+        # subprocess.call(['rabbitmqctl', 'status'])
+        # subprocess.call(['rabbitmqctl', 'cluster_status'])
+        time.sleep(10)
 
 if __name__ == '__main__':
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s'
-    )
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s [%(levelname)s] %(message)s')
     run()
